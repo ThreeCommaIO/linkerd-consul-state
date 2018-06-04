@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import requests
 import argparse
 import json
@@ -7,7 +8,65 @@ def intersect(a, b):
     """ return the intersection of two lists """
     return list(set(a) & set(b))
 
+class LinkerdStateConsul(object):
+    def __init__(self, client_state, consul):
+        self.consul = consul
+        self.client_state = client_state
+
+    def consul_list_services(self):
+        path = "http://{}/v1/catalog/services".format(self.consul)
+        r = requests.get(path)
+        keys = r.json().keys()
+        if 'consul' in keys:
+            keys.remove('consul')
+
+        return keys
+
+    def consul_list_nodes(self, service):
+        path = "http://{}/v1/catalog/service/{}".format(self.consul, service)
+        r = requests.get(path)
+        nodes = [
+                    {
+                        'Node': n.get('Node', None),
+                        'Datacenter': n.get('Datacenter', None),
+                        'ServiceAddress': n.get('ServiceAddress', None),
+                        'ServicePort': n.get('ServicePort', None),
+                        'Address': n.get('Address', None),
+                    } \
+                for n in r.json()]
+        return nodes
+
+
+    def consul_list_addresses(self, service):
+        nodes = self.consul_list_nodes(service)
+        return ['%s:%s' % (n['Address'], n['ServicePort']) for n in nodes]
+
+    def analyze(self):
+        # refresh the state
+        self.client_state.fetch()
+
+        services = self.consul_list_services()
+        consul_services = {}
+        output = {}
+
+        for service in services:
+            nodes = self.consul_list_addresses(service)
+            consul_services[service] = nodes
+
+        linkerd_services = self.client_state.filter_service_addresses(self.client_state.find_localhost_entries())
+        intersection = intersect(linkerd_services.keys(), consul_services.keys())
+
+        for service in intersection:
+            for node in linkerd_services[service]:
+                if node not in consul_services[service]:
+                    output[service] = output.get(service, []) + [node]
+
+        return output
+
 class LinkerdClientState(object):
+    def fetch(self):
+        pass
+
     def _strip_service(self, value):
         return value.split('/')[-1:][0]
 
@@ -25,40 +84,17 @@ class LinkerdClientState(object):
 class LinkerdClientStateLocal(LinkerdClientState):
     def __init__(self, filename):
         self.filename = filename
+
+    def fetch(self):
         self.data = json.loads(open(self.filename).read())
 
 class LinkerdClientStateRemote(LinkerdClientState):
     def __init__(self, remote_address):
         self.remote_address = remote_address
         self.path = "http://{}/client_state.json".format(remote_address)
+
+    def fetch(self):
         self.data = requests.get(self.path).json()
-
-def consul_list_services(consul):
-    path = "http://{}/v1/catalog/services".format(consul)
-    r = requests.get(path)
-    keys = r.json().keys()
-    if 'consul' in keys:
-        keys.remove('consul')
-
-    return keys
-
-def consul_list_nodes(consul, service):
-    path = "http://{}/v1/catalog/service/{}".format(consul, service)
-    r = requests.get(path)
-    nodes = [
-                {
-                    'Node': n.get('Node', None),
-                    'Datacenter': n.get('Datacenter', None),
-                    'ServiceAddress': n.get('ServiceAddress', None),
-                    'ServicePort': n.get('ServicePort', None),
-                    'Address': n.get('Address', None),
-                } \
-            for n in r.json()]
-    return nodes
-
-def consul_list_addresses(consul, service):
-    nodes = consul_list_nodes(consul, service)
-    return ['%s:%s' % (n['Address'], n['ServicePort']) for n in nodes]
 
 def main():
     parser = argparse.ArgumentParser(description='Validate consul state matches linkerd client_state.json')
@@ -82,21 +118,9 @@ def main():
     else:
         client_state = LinkerdClientStateRemote(linkerd)
 
-    services = consul_list_services(consul)
-    consul_services = {}
-    output = {}
 
-    for service in services:
-        nodes = consul_list_addresses(consul, service)
-        consul_services[service] = nodes
-
-    linkerd_services = client_state.filter_service_addresses(client_state.find_localhost_entries())
-    intersection = intersect(linkerd_services.keys(), consul_services.keys())
-
-    for service in intersection:
-        for node in linkerd_services[service]:
-            if node not in consul_services[service]:
-                output[service] = output.get(service, []) + [node]
+    state = LinkerdStateConsul(client_state, consul)
+    output = state.analyze()
 
     # check if any services mismatched, exit 1 if so
     if len(output.keys()):
